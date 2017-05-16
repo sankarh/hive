@@ -506,6 +506,159 @@ public class TestReplicationScenarios {
   }
 
   @Test
+  public void testBootstrapWithConcurrentRenameTable() throws IOException {
+    String name = testName.getMethodName();
+    String dbName = createDB(name);
+    run("CREATE TABLE " + dbName + ".unptned(a string) STORED AS TEXTFILE");
+    run("CREATE TABLE " + dbName + ".ptned(a string) partitioned by (b int) STORED AS TEXTFILE");
+
+    String[] unptn_data = new String[]{ "eleven" , "twelve" };
+    String[] ptn_data_1 = new String[]{ "thirteen", "fourteen", "fifteen"};
+    String[] ptn_data_2 = new String[]{ "fifteen", "sixteen", "seventeen"};
+    String[] empty = new String[]{};
+
+    String unptn_locn = new Path(TEST_PATH, name + "_unptn").toUri().getPath();
+    String ptn_locn_1 = new Path(TEST_PATH, name + "_ptn1").toUri().getPath();
+    String ptn_locn_2 = new Path(TEST_PATH, name + "_ptn2").toUri().getPath();
+
+    createTestDataFile(unptn_locn, unptn_data);
+    createTestDataFile(ptn_locn_1, ptn_data_1);
+    createTestDataFile(ptn_locn_2, ptn_data_2);
+
+    run("LOAD DATA LOCAL INPATH '" + unptn_locn + "' OVERWRITE INTO TABLE " + dbName + ".unptned");
+    verifySetup("SELECT * from " + dbName + ".unptned", unptn_data);
+    run("LOAD DATA LOCAL INPATH '" + ptn_locn_1 + "' OVERWRITE INTO TABLE " + dbName + ".ptned PARTITION(b=1)");
+    verifySetup("SELECT a from " + dbName + ".ptned WHERE b=1", ptn_data_1);
+    run("LOAD DATA LOCAL INPATH '" + ptn_locn_2 + "' OVERWRITE INTO TABLE " + dbName + ".ptned PARTITION(b=2)");
+    verifySetup("SELECT a from " + dbName + ".ptned WHERE b=2", ptn_data_2);
+
+    advanceDumpDir();
+
+    BehaviourInjection<Table,Table> ptnedTableNuller = new BehaviourInjection<Table,Table>(){
+      @Nullable
+      @Override
+      public Table apply(@Nullable Table table) {
+        if (table.getTableName().equalsIgnoreCase("ptned")){
+          injectionPathCalled = true;
+          return null;
+        } else {
+          nonInjectedPathCalled = true;
+          return table;
+        }
+      }
+    };
+    InjectableBehaviourObjectStore.setGetTableBehaviour(ptnedTableNuller);
+
+    // The ptned table will not be dumped as getTable will return null
+    run("REPL DUMP " + dbName);
+    ptnedTableNuller.assertInjectionsPerformed(true,true);
+    InjectableBehaviourObjectStore.resetGetTableBehaviour(); // reset the behaviour
+
+    String replDumpLocn = getResult(0, 0);
+    String replDumpId = getResult(0, 1, true);
+    LOG.info("Bootstrap-Dump: Dumped to {} with id {}", replDumpLocn, replDumpId);
+    run("REPL LOAD " + dbName + "_dupe FROM '" + replDumpLocn + "'");
+
+    // The ptned table should miss in target as the table was marked virtually as dropped
+    verifyRun("SELECT * from " + dbName + "_dupe.unptned", unptn_data);
+    verifyIfTableNotExist(dbName + "_dupe", "ptned");
+
+    // Verify if Rename table on a non-existing table creates a new table with new name
+    run("ALTER TABLE " + dbName + ".ptned RENAME TO " + dbName + ".ptned_renamed");
+    verifyIfTableNotExist(dbName, "ptned");
+    verifyIfTableExist(dbName, "ptned_renamed");
+
+    advanceDumpDir();
+    run("REPL DUMP " + dbName + " FROM " + replDumpId);
+    String postDropReplDumpLocn = getResult(0,0);
+    String postDropReplDumpId = getResult(0,1,true);
+    LOG.info("Dumped to {} with id {}->{}", postDropReplDumpLocn, replDumpId, postDropReplDumpId);
+    assert(run("REPL LOAD " + dbName + "_dupe FROM '" + postDropReplDumpLocn + "'", true));
+
+    verifyIfTableNotExist(dbName + "_dupe", "ptned");
+    verifyIfTableExist(dbName + "_dupe", "ptned_renamed");
+    verifyRun("SELECT * from " + dbName + "_dupe.unptned", unptn_data);
+    verifyRun("SELECT a from " + dbName + "_dupe.ptned_renamed WHERE b=1", ptn_data_1);
+    verifyRun("SELECT a from " + dbName + "_dupe.ptned_renamed WHERE b=2", ptn_data_2);
+  }
+
+  @Test
+  public void testBootstrapWithConcurrentRenamePartition() throws IOException {
+    String name = testName.getMethodName();
+    String dbName = createDB(name);
+    run("CREATE TABLE " + dbName + ".ptned(a string) partitioned by (b int) STORED AS TEXTFILE");
+
+    String[] ptn_data_1 = new String[]{ "thirteen", "fourteen", "fifteen"};
+    String[] ptn_data_2 = new String[]{ "fifteen", "sixteen", "seventeen"};
+    String[] empty = new String[]{};
+
+    String ptn_locn_1 = new Path(TEST_PATH, name + "_ptn1").toUri().getPath();
+    String ptn_locn_2 = new Path(TEST_PATH, name + "_ptn2").toUri().getPath();
+
+    createTestDataFile(ptn_locn_1, ptn_data_1);
+    createTestDataFile(ptn_locn_2, ptn_data_2);
+
+    run("LOAD DATA LOCAL INPATH '" + ptn_locn_1 + "' OVERWRITE INTO TABLE " + dbName + ".ptned PARTITION(b=1)");
+    verifySetup("SELECT a from " + dbName + ".ptned WHERE b=1", ptn_data_1);
+    run("LOAD DATA LOCAL INPATH '" + ptn_locn_2 + "' OVERWRITE INTO TABLE " + dbName + ".ptned PARTITION(b=2)");
+    verifySetup("SELECT a from " + dbName + ".ptned WHERE b=2", ptn_data_2);
+
+    advanceDumpDir();
+
+    BehaviourInjection<List<String>, List<String>> listPartitionNamesNuller
+            = new BehaviourInjection<List<String>, List<String>>(){
+      @Nullable
+      @Override
+      public List<String> apply(@Nullable List<String> partitions) {
+        injectionPathCalled = true;
+        List<String> ptns = new ArrayList<String>();
+        for (String name : partitions) {
+          if (!name.equalsIgnoreCase("b=1")) {
+            ptns.add(name);
+          }
+        }
+        return ptns;
+      }
+    };
+    InjectableBehaviourObjectStore.setListPartitionNamesBehaviour(listPartitionNamesNuller);
+
+    // The partition(b=1) will not be dumped as it is removed from the partitions list
+    run("REPL DUMP " + dbName);
+    listPartitionNamesNuller.assertInjectionsPerformed(true, false);
+    InjectableBehaviourObjectStore.resetListPartitionNamesBehaviour(); // reset the behaviour
+
+    String replDumpLocn = getResult(0, 0);
+    String replDumpId = getResult(0, 1, true);
+    LOG.info("Bootstrap-Dump: Dumped to {} with id {}", replDumpLocn, replDumpId);
+    run("REPL LOAD " + dbName + "_dupe FROM '" + replDumpLocn + "'");
+
+    // The partition(b=1) should miss in target as it was marked virtually as dropped
+    verifyRun("SELECT a from " + dbName + "_dupe.ptned WHERE b=1", empty);
+    verifyRun("SELECT a from " + dbName + "_dupe.ptned WHERE b=2", ptn_data_2);
+    verifyIfPartitionNotExist(dbName + "_dupe", "ptned", new ArrayList<>(Arrays.asList("1")));
+
+    // Verify if rename partition on a non-existing partition is idempotent and just create a new partition.
+    run("ALTER TABLE " + dbName + ".ptned PARTITION (b=1) RENAME TO PARTITION (b=10)");
+    verifyIfPartitionNotExist(dbName, "ptned", new ArrayList<>(Arrays.asList("1")));
+    verifyIfPartitionExist(dbName, "ptned", new ArrayList<>(Arrays.asList("10")));
+    verifySetup("SELECT a from " + dbName + ".ptned WHERE b=1", empty);
+    verifySetup("SELECT a from " + dbName + ".ptned WHERE b=10", ptn_data_1);
+
+    advanceDumpDir();
+    run("REPL DUMP " + dbName + " FROM " + replDumpId);
+    String postDropReplDumpLocn = getResult(0,0);
+    String postDropReplDumpId = getResult(0,1,true);
+    LOG.info("Dumped to {} with id {}->{}", postDropReplDumpLocn, replDumpId, postDropReplDumpId);
+    assert(run("REPL LOAD " + dbName + "_dupe FROM '" + postDropReplDumpLocn + "'", true));
+
+    verifyIfPartitionNotExist(dbName + "_dupe", "ptned", new ArrayList<>(Arrays.asList("1")));
+    verifyIfPartitionExist(dbName + "_dupe", "ptned", new ArrayList<>(Arrays.asList("10")));
+    verifyRun("SELECT a from " + dbName + "_dupe.ptned WHERE b=1", empty);
+    verifyRun("SELECT a from " + dbName + "_dupe.ptned WHERE b=10", ptn_data_1);
+    verifyRun("SELECT a from " + dbName + "_dupe.ptned WHERE b=2", ptn_data_2);
+  }
+
+  @Test
   public void testIncrementalAdds() throws IOException {
     String name = testName.getMethodName();
     String dbName = createDB(name);
