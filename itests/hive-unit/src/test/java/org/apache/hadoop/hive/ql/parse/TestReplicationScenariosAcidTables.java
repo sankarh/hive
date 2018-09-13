@@ -760,4 +760,70 @@ public class TestReplicationScenariosAcidTables {
     replica.run("drop database " + dbName1 + " cascade");
     replica.run("drop database " + dbName2 + " cascade");
   }
+
+  @Test
+  public void testMaterializedViewReplication() throws Throwable {
+    // Bootstrap dump with one materialized view mv1 using 2 tables
+    WarehouseInstance.Tuple bootstrapTuple = primary.run("use " + primaryDbName)
+            .run("create table table1 (i int) clustered by(i) into 3 buckets stored as orc " +
+                    "tblproperties (\"transactional\"=\"true\")")
+            .run("create table table2 (id int) partitioned by (country string) clustered by(id) " +
+                    "into 3 buckets stored as orc " +
+                    "tblproperties (\"transactional\"=\"true\")")
+            .run("insert into table1 values (1)")
+            .run("insert into table2 partition(country='india') values(1)")
+            .run("create materialized view mv1 as select table1.i, table2.country from table1 join table2 on table1.i=table2.id")
+            .dump(primaryDbName, null);
+
+    // Bootstrap load in replica with mv1
+    replica.load(replicatedDbName, bootstrapTuple.dumpLocation)
+            .status(replicatedDbName)
+            .verifyResult(bootstrapTuple.lastReplicationId)
+            .run("use " + replicatedDbName)
+            .run("show tables")
+            .verifyResults(new String[] {"table1", "table2"})
+            .run("select * from table1")
+            .verifyResults(new String[] {"1"})
+            .run("select id from table2 order by id")
+            .verifyResults(new String[] {"1"})
+            .run("select i from mv1 order by i")
+            .verifyResults(new String[] {"1"});
+
+    // Incremental dump with mv1 rebuild and create another materialized view using both tables.
+    WarehouseInstance.Tuple incrementalTuple = primary.run("use " + primaryDbName)
+            .run("insert into table1 values (2),(3)")
+            .run("insert into table2 partition(country='india') values(3)")
+            .run("alter materialized view mv1 rebuild")
+            .run("create materialized view mv2 as select table1.i, table2.country from table1 join table2 on table1.i=table2.id where table1.i>2")
+            .dump(primaryDbName, bootstrapTuple.lastReplicationId);
+
+    // Incremental load
+    replica.load(replicatedDbName, incrementalTuple.dumpLocation)
+            .status(replicatedDbName)
+            .verifyResult(incrementalTuple.lastReplicationId)
+            .run("use " + replicatedDbName)
+            .run("select * from table1")
+            .verifyResults(new String[] {"1", "2", "3"})
+            .run("select id from table2 order by id")
+            .verifyResults(new String[] {"1", "3"})
+            .run("select i from mv1 order by i")
+            .verifyResults(new String[] {"1", "3"})
+            .run("select i from mv2 order by i")
+            .verifyResults(new String[] {"3"});
+
+    // Drop the source tables and rebuild mv1 and mv2 directly at target to see if it works
+    primary.run("use " + primaryDbName)
+            .run("drop table table1")
+            .run("drop table table2");
+
+    replica.run("use " + replicatedDbName)
+            .run("insert into table1 values (4),(5)")
+            .run("insert into table2 partition(country='us') values(4)")
+            .run("alter materialized view mv1 rebuild")
+            .run("select i from mv1 order by i")
+            .verifyResults(new String[] {"1", "3", "4"})
+            .run("alter materialized view mv2 rebuild")
+            .run("select i from mv1 order by i")
+            .verifyResults(new String[] {"3", "4"});
+  }
 }

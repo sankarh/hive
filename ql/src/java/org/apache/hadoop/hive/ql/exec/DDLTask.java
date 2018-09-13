@@ -4924,8 +4924,8 @@ public class DDLTask extends Task<DDLWork> implements Serializable {
         throw new HiveException(ErrorMsg.TABLE_ALREADY_EXISTS.getMsg(crtView.getViewName()));
       }
 
-      // It should not be a materialized view
-      assert !crtView.isMaterialized();
+      // It should not be a materialized view unless it is REPL LOAD
+      assert (crtView.getReplicationSpec().isInReplicationScope() || !crtView.isMaterialized());
 
       // replace existing view
       // remove the existing partition columns from the field schema
