@@ -147,6 +147,7 @@ public class TestTxnCommands2 {
     //TestTxnCommands2WithSplitUpdateAndVectorization has the vectorized version
     //of these tests.
     hiveConf.setBoolVar(HiveConf.ConfVars.HIVE_VECTORIZATION_ENABLED, false);
+    hiveConf.setBoolVar(HiveConf.ConfVars.HIVECONVERTJOIN, true);
 
     TxnDbUtil.setConfValues(hiveConf);
     TxnDbUtil.prepDb(hiveConf);
@@ -317,6 +318,17 @@ public class TestTxnCommands2 {
     List<String> rs = runStatementOnDriver("select a,b from " + Table.NONACIDORCTBL);
     runStatementOnDriver("insert into " + Table.NONACIDORCTBL + "(a,b) values(2,3)");
     List<String> rs1 = runStatementOnDriver("select a,b from " + Table.NONACIDORCTBL);
+  }
+
+  @Test
+  public void testMergeFailure() throws Throwable {
+    runStatementOnDriver("DROP TABLE IF EXISTS customer_target");
+    runStatementOnDriver("DROP TABLE IF EXISTS customer_source");
+    runStatementOnDriver("CREATE TABLE customer_target (id STRING, first_name STRING, last_name STRING, age INT) clustered by (id) into 2 buckets stored as ORC TBLPROPERTIES ('transactional'='true')");
+    runStatementOnDriver("insert into customer_target values ('001', 'John', 'Smith', 45), ('002', 'Michael', 'Watson', 27), ('003', 'Den', 'Brown', 33)");
+    runStatementOnDriver("CREATE TABLE customer_source (id STRING, first_name STRING, last_name STRING, age INT)");
+    runStatementOnDriver("insert into customer_source values ('001', 'Dorothi', 'Hogward', 77), ('007', 'Alex', 'Bowee', 1), ('088', 'Robert', 'Dowson', 25)");
+    runStatementOnDriver("merge into customer_target trg using customer_source src on src.id = trg.id when matched then update set first_name = src.first_name, last_name = src.last_name when not matched then insert values (src.id, src.first_name, src.last_name, src.age)");
   }
 
   @Test
